@@ -264,15 +264,25 @@ cmd_review() {
   done
   [ ${#VALID[@]} -eq 0 ] && { echo "work: no usable agents" >&2; exit 1; }
 
-  # /clear policy:
-  #   • ALL agents: /clear when task_id changed (clear_first=1) — different work entirely.
-  #   • OPENCODE agents (kimi/deepseek): ALWAYS /clear, even within same task / same round.
+  # Clear policy:
+  #   • ALL agents: clear when task_id changed (clear_first=1) — different work entirely.
+  #   • OPENCODE agents (kimi/deepseek): ALWAYS clear, even within same task / same round.
   #     Reason: opencode TUIs preserve conversation history across nudges, which causes
   #     the reviewer to drift conversational ("what would you like me to do with this?")
   #     instead of treating each nudge as a fresh directive. Cross-round context is
   #     preserved via <prior-rounds> in the XML pack, NOT via session memory.
   #   • Codex + Gemini: respect clear_first only — they're directive enough to handle
   #     in-session context without drifting.
+  #
+  # Per-CLI command:
+  #   • Codex + Gemini → /clear
+  #   • Opencode      → /new (opencode doesn't have /clear, /new starts a fresh session)
+  clear_cmd_for() {
+    case "$1" in
+      opencode) echo "/new" ;;
+      *)        echo "/clear" ;;
+    esac
+  }
   for name in "${VALID[@]}"; do
     needs_clear=0
     [ "$clear_first" -eq 1 ] && needs_clear=1
@@ -280,8 +290,9 @@ cmd_review() {
     if [ "$needs_clear" -eq 1 ]; then
       reason="task changed"
       [ "$clear_first" -eq 0 ] && reason="opencode always-clear"
-      echo "  ⌫ /clear → $name ($reason)" >&2
-      tmux send-keys -t "${SESS[$name]}" "/clear" Enter 2>/dev/null || true
+      cmd=$(clear_cmd_for "${TYPE[$name]}")
+      echo "  ⌫ $cmd → $name ($reason)" >&2
+      tmux send-keys -t "${SESS[$name]}" "$cmd" Enter 2>/dev/null || true
       sleep 1
     fi
   done
