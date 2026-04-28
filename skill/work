@@ -331,7 +331,11 @@ cmd_review() {
         # opens opencode's slash-command or agent-picker mid-paste, swallowing
         # the rest of the prompt (saw this with deepseek showing "Select agent").
         # Plain prose with absolute paths embedded mid-sentence avoids both.
-        prompt="Round $round reviewer: read the XML pack at ${pack_path} (the ask block says what to review, the response-schema block specifies the exact XML format), then use your write_file tool (NOT cat or echo or tee or printf, which prompt for shell permission) to write your XML findings to ${out_file}, ending the file with a single line containing exactly: ## DONE — without that the orchestrator hangs. Begin immediately, do NOT ask clarifying questions, do NOT respond conversationally."
+        # Note: opencode's read tool defaults to 2000 lines/call. Packs run
+        # 4000-5000 lines, so explicitly tell the reviewer to use limit:5000
+        # OR read the whole file. Pack is also ordered with critical content
+        # at the top (task → ask → schema → relevant-code), but we still nudge.
+        prompt="Round $round reviewer: read the ENTIRE XML pack at ${pack_path} — your read tool may default to 2000 lines per call but this pack can run 4000-5000 lines, so call read with limit set high (e.g. limit: 6000) OR read in chunks (offset 0, then offset 2000, then offset 4000) to ensure you see the full pack including <relevant-code> and <response-schema>. The pack starts with <task>, <ask>, <response-schema> at the top; the source files you must verify findings against are in <relevant-code><file>...</file> blocks inside <context>. Use your write_file tool (NOT cat or echo or tee or printf, which prompt for shell permission) to write your XML findings to ${out_file}, ending the file with a single line containing exactly: ## DONE — without that the orchestrator hangs. Begin immediately, do NOT ask clarifying questions, do NOT respond conversationally."
         ;;
       *)
         # Codex (default) — multi-line is fine.

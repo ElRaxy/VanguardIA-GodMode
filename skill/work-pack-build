@@ -28,7 +28,7 @@ JOURNAL_DIR = HOME / ".claude/conversations"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
 MAX_CTX_BYTES = 800_000  # cap pack size — reviewers have 1M+ ctx (Opus 4.7, Gemini 3.1 Pro, Kimi K2.6)
-MAX_FILE_BYTES = 30_000  # per-file cap when including code
+MAX_FILE_BYTES = 80_000  # per-file cap when including code (bumped 2026-04-28: 30K silently truncated 1432-LOC legacy files in plan reviews)
 MAX_JOURNAL_ENTRIES = 5  # most recent entries from any matched journal
 
 
@@ -212,33 +212,92 @@ def emit_pack(args, ctx: dict) -> str:
         f'created="{datetime.now(timezone.utc).isoformat()}">'
     )
 
+    # ── ORDERING — critical for opencode reviewers ─────────────────────
+    # OpenCode's `read` tool defaults to a 2000-line cap per call. Big packs
+    # can run 4000-5000 lines. So review-critical sections (task, ask,
+    # response-schema, relevant-code, diff) MUST be in the first ~2000 lines.
+    # Reference context (arch_docs, planning, memory, journals) goes later
+    # — reviewers who need it can do a second read with offset.
+    #
+    # Order:  task → ask → response-schema → relevant-code/diff/test →
+    #         arch_docs → planning → memory → journals → prior-rounds →
+    #         reviewer-instruction (truncation warning)
+
     # Task
     parts.append("  <task>")
     parts.append(f"    {cdata(args.task)}")
     parts.append("  </task>")
 
-    # Context
+    # Ask — explicit instructions for the reviewer (small, always visible)
+    ask = build_ask(args.mode, args.round)
+    parts.append("  <ask>")
+    parts.append(f"    {cdata(ask)}")
+    parts.append("  </ask>")
+
+    # Response schema — what the reviewer must return (small, always visible)
+    parts.append("  <response-schema>")
+    parts.append(f"    {cdata(RESPONSE_SCHEMA)}")
+    parts.append("  </response-schema>")
+
+    # Reviewer instruction injected ONLY when truncation fired. Moved to top
+    # so opencode reviewers see it before being tempted to confabulate.
+    if ctx.get("diff_truncated_from"):
+        truncation_warning = (
+            "The <diff> block was truncated to fit pack size. The full source files "
+            "are included as <relevant-code><file> blocks below. For EVERY finding "
+            "you report, verify the claim against the relevant <file> block — do "
+            "NOT rely on the truncated diff alone. If a claim cannot be verified "
+            "against a <file>, omit the finding rather than reporting a "
+            "possibly-truncation-induced hallucination."
+        )
+        parts.append('  <reviewer-instruction priority="critical">')
+        parts.append(f"    {cdata(truncation_warning)}")
+        parts.append("  </reviewer-instruction>")
+
+    # Context — review-target content (relevant code + diff + tests) FIRST
     parts.append("  <context>")
 
-    # Architecture / coding-principle docs
+    # Relevant code (PRIMARY review target — must be visible to opencode)
+    if ctx["code_files"]:
+        parts.append("    <relevant-code>")
+        for f in ctx["code_files"]:
+            if not f.exists():
+                continue
+            parts.append(f'      <file path="{esc(str(f))}">{cdata(read_capped(f))}</file>')
+        parts.append("    </relevant-code>")
+
+    # Diff (PRIMARY for implement/major-bug)
+    if ctx.get("diff"):
+        truncated_from = ctx.get("diff_truncated_from")
+        if truncated_from:
+            parts.append(f'    <diff truncated="true" original-bytes="{truncated_from}" shown-bytes="{len(ctx["diff"])}">')
+        else:
+            parts.append("    <diff>")
+        parts.append(f"      {cdata(ctx['diff'])}")
+        parts.append("    </diff>")
+
+    # Failing test (major-bug mode)
+    if ctx.get("failing_test"):
+        parts.append(f'    <failing-test path="{esc(ctx["failing_test"]["path"])}">')
+        parts.append(f"      <test-code>{cdata(ctx['failing_test']['code'])}</test-code>")
+        parts.append(f"      <test-output>{cdata(ctx['failing_test']['output'])}</test-output>")
+        parts.append("    </failing-test>")
+
+    # Architecture / coding-principle docs (REFERENCE — likely past line 2000)
     if ctx["arch_docs"]:
         parts.append("    <architecture-docs>")
         for f in ctx["arch_docs"]:
             parts.append(f'      <doc path="{esc(str(f))}">{cdata(read_capped(f))}</doc>')
         parts.append("    </architecture-docs>")
 
-    # Planning docs
+    # Planning docs (REFERENCE)
     if ctx["planning_docs"]:
         parts.append("    <planning-docs>")
         for f in ctx["planning_docs"]:
-            parts.append(f'      <doc path="{esc(str(f))}">{cdata(read_capped(f, 10_000))}</doc>')
+            parts.append(f'      <doc path="{esc(str(f))}">{cdata(read_capped(f, 200_000))}</doc>')
         parts.append("    </planning-docs>")
 
-    # Related memory + journals — skipped on round 2+ because they don't
-    # change between rounds and the reviewer already saw them in round 1.
-    # Saves ~30-60% of pack size on follow-up rounds. Reviewer is reminded
-    # via the <ask> block that they're in round 2+ and to use <prior-rounds>
-    # for cross-round context.
+    # Related memory + journals — skipped on round 2+ (don't change between rounds)
     if args.round == 1:
         if ctx["memory_files"]:
             parts.append("    <related-memory>")
@@ -255,75 +314,20 @@ def emit_pack(args, ctx: dict) -> str:
                 parts.append("      </journal>")
             parts.append("    </related-journals>")
     else:
-        # Round 2+: emit a stub pointing at round 1's pack for any reviewer
-        # that wants to refresh its memory.
         skipped_count = len(ctx.get("memory_files") or []) + len(ctx.get("journals") or [])
         if skipped_count:
             parts.append(f'    <stable-context-skipped reason="round-{args.round}-no-change-since-round-1" '
                          f'memory-files-omitted="{len(ctx.get("memory_files") or [])}" '
                          f'journals-omitted="{len(ctx.get("journals") or [])}"/>')
 
-    # Relevant code (changed files for implement/bug modes)
-    if ctx["code_files"]:
-        parts.append("    <relevant-code>")
-        for f in ctx["code_files"]:
-            if not f.exists():
-                continue
-            parts.append(f'      <file path="{esc(str(f))}">{cdata(read_capped(f))}</file>')
-        parts.append("    </relevant-code>")
-
-    # Failing test (major-bug mode)
-    if ctx.get("failing_test"):
-        parts.append(f'    <failing-test path="{esc(ctx["failing_test"]["path"])}">')
-        parts.append(f"      <test-code>{cdata(ctx['failing_test']['code'])}</test-code>")
-        parts.append(f"      <test-output>{cdata(ctx['failing_test']['output'])}</test-output>")
-        parts.append("    </failing-test>")
-
-    # Diff
-    if ctx.get("diff"):
-        truncated_from = ctx.get("diff_truncated_from")
-        if truncated_from:
-            parts.append(f'    <diff truncated="true" original-bytes="{truncated_from}" shown-bytes="{len(ctx["diff"])}">')
-        else:
-            parts.append("    <diff>")
-        parts.append(f"      {cdata(ctx['diff'])}")
-        parts.append("    </diff>")
-
     parts.append("  </context>")
 
-    # Reviewer instruction injected ONLY when truncation fired — tells the
-    # reviewer not to anchor on the truncated diff. Without this, reviewers
-    # report findings that are visible in the truncated portion but
-    # contradicted by the full <code_files> attachments above.
-    if ctx.get("diff_truncated_from"):
-        truncation_warning = (
-            "The <diff> block was truncated to fit pack size. The full source files "
-            "are included as <code_file> blocks above. For EVERY finding you report, "
-            "verify the claim against the relevant <code_file> block — do NOT rely "
-            "on the truncated diff alone. If a claim cannot be verified against a "
-            "<code_file>, omit the finding rather than reporting a "
-            "possibly-truncation-induced hallucination."
-        )
-        parts.append('  <reviewer-instruction priority="critical">')
-        parts.append(f"    {cdata(truncation_warning)}")
-        parts.append("  </reviewer-instruction>")
-
-    # Prior rounds
+    # Prior rounds (only present in round 2+) — moved to end since it grows
+    # cumulatively. Reviewers needing it know to seek past line 2000.
     if args.prior_rounds_file and Path(args.prior_rounds_file).exists():
         parts.append("  <prior-rounds>")
         parts.append(f"    {cdata(Path(args.prior_rounds_file).read_text(errors='replace'))}")
         parts.append("  </prior-rounds>")
-
-    # Ask — explicit instructions for the reviewer
-    ask = build_ask(args.mode, args.round)
-    parts.append("  <ask>")
-    parts.append(f"    {cdata(ask)}")
-    parts.append("  </ask>")
-
-    # Response schema — what the reviewer must return
-    parts.append("  <response-schema>")
-    parts.append(f"    {cdata(RESPONSE_SCHEMA)}")
-    parts.append("  </response-schema>")
 
     parts.append("</review-pack>")
     return "\n".join(parts)
