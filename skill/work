@@ -826,7 +826,18 @@ cmd_status() {
       local bytes
       bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
 
-      # Pane state
+      # Pane state. Detection layers, in order:
+      #   1. DONE marker is in the file              → DONE
+      #   2. Pane shows provider error               → ERRORED
+      #   3. Pane shows opencode modal popup         → POPUP-STUCK
+      #   4. Pane shows permission prompt            → PERM-PROMPT
+      #   5. Pane shows known WORKING signal         → WORKING
+      #      • opencode: "esc interrupt" + animated dots
+      #      • codex/gemini: "Working" / "Thinking" / "Generating" / "esc"
+      #      • braille spinners ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ used by every modern CLI
+      #   6. File has grown past the stub (~120 B)   → WRITING (silent)
+      #   7. Elapsed < 15s since nudge               → WORKING (just nudged)
+      #   8. Fallthrough                             → idle?  (truly stuck)
       local state pane=""
       pane=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -30 || true)
       if [ "$done_str" = "✓" ]; then
@@ -837,8 +848,12 @@ cmd_status() {
         state="\033[1;33mPOPUP-STUCK\033[0m"
       elif echo "$pane" | grep -qiE 'Allow this|Allow execution|Allow once|Approve this|\(y/N\)|\[y/N\]'; then
         state="\033[1;33mPERM-PROMPT\033[0m"
-      elif echo "$pane" | grep -qiE 'Working|Thinking|in progress|generating|reading|writing'; then
+      elif echo "$pane" | grep -qE 'esc[ ]+(to[ ]+)?(interrupt|cancel)|Working|Thinking|Generating|Streaming|Processing|Reading|Writing|Sending|Receiving|⬝|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|↑↓|interrupt'; then
         state="\033[1;34mWORKING\033[0m"
+      elif [ "$bytes" -gt 200 ]; then
+        state="\033[1;34mWRITING\033[0m"
+      elif [ "$elapsed_s" -lt 15 ]; then
+        state="\033[1;34mWORKING\033[0m (just nudged)"
       else
         state="\033[2midle?\033[0m"
       fi
