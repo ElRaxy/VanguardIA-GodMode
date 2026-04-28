@@ -763,6 +763,115 @@ STUB
   # repainting the previous error frame).
 }
 
+cmd_approve() {
+  # Manual one-shot: run the runtime-guard logic against a single agent's
+  # tmux pane, regardless of whether an orchestrator is active. Use when an
+  # orchestrator timed out/exited and the agent is now stuck on a prompt.
+  # Usage: work approve <agent>
+  local name="${1:-}"
+  [ -z "$name" ] && { echo "work approve <agent>" >&2; return 2; }
+  local sess
+  sess=$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // empty' "$AGENTS_JSON")
+  [ -z "$sess" ] && { echo "work approve: unknown agent '$name'" >&2; return 1; }
+  tmux has-session -t "$sess" 2>/dev/null || { echo "work approve: tmux session '$sess' is dead" >&2; return 1; }
+
+  local pane
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
+  if echo "$pane" | grep -qiE "$DESTRUCTIVE_RE"; then
+    echo "  🛑 DESTRUCTIVE prompt detected — refusing. Attach with: tmux attach -t $sess" >&2
+    return 1
+  fi
+  if ! echo "$pane" | grep -qiE "$PROMPT_RE"; then
+    echo "  $name: no permission prompt visible right now" >&2
+    return 0
+  fi
+  if echo "$pane" | grep -qE "$OPENCODE_PROMPT_RE"; then
+    echo "  ↩ $name: opencode arrow-key — sending Right + Enter" >&2
+    tmux send-keys -t "$sess" Right Enter
+  elif echo "$pane" | grep -qiE "$NUMBERED_PROMPT_RE"; then
+    echo "  ↩ $name: gemini numbered — sending 2 + Enter (Allow for session)" >&2
+    tmux send-keys -t "$sess" "2" Enter
+  else
+    echo "  ↩ $name: codex y/n — sending y + Enter" >&2
+    tmux send-keys -t "$sess" "y" Enter
+  fi
+}
+
+cmd_babysit() {
+  # Long-running daemon that polls every tmux session in agents.json for
+  # prompts/popups/errors and handles them — regardless of whether any
+  # /work orchestrator is active. Use this when running reviews that
+  # outlive Claude's Bash tool window.
+  # Usage: work babysit [--interval <sec>] [--once]
+  local interval=5 once=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --interval) interval="$2"; shift 2 ;;
+      --once)     once=1; shift ;;
+      *) echo "work babysit [--interval <sec>] [--once]" >&2; return 2 ;;
+    esac
+  done
+
+  echo "▶ work babysit started (interval=${interval}s, sessions: $(jq -r '[.agents[].name] | join(", ")' "$AGENTS_JSON"))" >&2
+  echo "  Approves safe shell prompts, dismisses opencode popups. Refuses destructive." >&2
+  echo "  Logs to $STATE_DIR/babysit.log. Ctrl-C to stop." >&2
+
+  declare -A LAST_APPROVED
+  while :; do
+    while IFS=$'\t' read -r name sess type; do
+      [ -z "$name" ] && continue
+      tmux has-session -t "$sess" 2>/dev/null || continue
+      local pane
+      pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
+
+      # Popup → dismiss
+      if [ "$type" = "opencode" ] && echo "$pane" | grep -qE "$OPENCODE_POPUP_RE"; then
+        local now last
+        now=$(date +%s)
+        last="${LAST_APPROVED[${name}_popup]:-0}"
+        if [ $((now - last)) -ge 10 ]; then
+          LAST_APPROVED[${name}_popup]=$now
+          echo "$(date -Iseconds) $name popup-dismiss" | tee -a "$STATE_DIR/babysit.log" >&2
+          tmux send-keys -t "$sess" Escape ; sleep 0.3 ; tmux send-keys -t "$sess" Escape
+        fi
+        continue
+      fi
+
+      # Permission prompt → approve (unless destructive)
+      if echo "$pane" | grep -qiE "$PROMPT_RE"; then
+        if echo "$pane" | grep -qiE "$DESTRUCTIVE_RE"; then
+          local now last
+          now=$(date +%s)
+          last="${LAST_APPROVED[${name}_destruct]:-0}"
+          if [ $((now - last)) -ge 60 ]; then
+            LAST_APPROVED[${name}_destruct]=$now
+            echo "$(date -Iseconds) $name DESTRUCTIVE-blocked (attach: tmux attach -t $sess)" | tee -a "$STATE_DIR/babysit.log" >&2
+          fi
+          continue
+        fi
+        local now last
+        now=$(date +%s)
+        last="${LAST_APPROVED[$name]:-0}"
+        [ $((now - last)) -lt 30 ] && continue
+        LAST_APPROVED[$name]=$now
+        if echo "$pane" | grep -qE "$OPENCODE_PROMPT_RE"; then
+          echo "$(date -Iseconds) $name approve(opencode)" | tee -a "$STATE_DIR/babysit.log" >&2
+          tmux send-keys -t "$sess" Right Enter
+        elif echo "$pane" | grep -qiE "$NUMBERED_PROMPT_RE"; then
+          echo "$(date -Iseconds) $name approve(gemini-numbered)" | tee -a "$STATE_DIR/babysit.log" >&2
+          tmux send-keys -t "$sess" "2" Enter
+        else
+          echo "$(date -Iseconds) $name approve(codex-y/n)" | tee -a "$STATE_DIR/babysit.log" >&2
+          tmux send-keys -t "$sess" "y" Enter
+        fi
+      fi
+    done < <(jq -r '.agents[] | "\(.name)\t\(.tmux_session)\t\(.type)"' "$AGENTS_JSON")
+
+    [ "$once" = "1" ] && break
+    sleep "$interval"
+  done
+}
+
 cmd_status() {
   # Live snapshot of the most-recent /work run. Replaces ad-hoc
   # "tmux capture-pane -t kimi" + "ls -la /tmp/work-*" gymnastics.
@@ -1018,13 +1127,15 @@ HOW
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────
-[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|status|state-get|state-set|clean|permissions} ..." >&2; exit 2; }
+[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|status|approve|babysit|state-get|state-set|clean|permissions} ..." >&2; exit 2; }
 
 sub="$1"; shift
 case "$sub" in
   pick-agents) cmd_pick_agents "$@" ;;
   review)      cmd_review "$@" ;;
   status)      cmd_status "$@" ;;
+  approve)     cmd_approve "$@" ;;
+  babysit)     cmd_babysit "$@" ;;
   state-get)   cmd_state_get ;;
   state-set)   cmd_state_set "$@" ;;
   clean)       cmd_clean "$@" ;;
