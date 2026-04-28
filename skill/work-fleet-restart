@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# work-fleet-restart — kill + respawn LLM tmux sessions with the correct
+# launch flags. Use after changing CLI configs, or to apply a model swap.
+#
+# Usage:
+#   work-fleet-restart              # restart gem-1, kimi, deepseek
+#   work-fleet-restart --all        # also restart cdx-1/2/3
+#   work-fleet-restart kimi         # restart only the named session(s)
+#   work-fleet-restart --dry-run    # show what would happen
+#
+# WARNING: kills any in-flight work in the targeted sessions. Check that
+# no /work review is currently running before invoking. Use `agent-status`
+# and inspect each session's pane first.
+
+set -euo pipefail
+
+DRY_RUN=0
+TARGETS=()
+INCLUDE_CDX=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --all)     INCLUDE_CDX=1; shift ;;
+    -h|--help)
+      awk '/^[^#]/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+      exit 0 ;;
+    *) TARGETS+=("$1"); shift ;;
+  esac
+done
+
+# Default targets if none specified
+if [ ${#TARGETS[@]} -eq 0 ]; then
+  TARGETS=(gem-1 kimi deepseek)
+  [ "$INCLUDE_CDX" -eq 1 ] && TARGETS=(cdx-1 cdx-2 cdx-3 gem-1 kimi deepseek)
+fi
+
+# Launch command for each session — single source of truth.
+launch_for() {
+  case "$1" in
+    cdx-1)
+      echo "bash -lc 'cd ~/dev/codex-bridge ; CODEX_HOME=$HOME/.codex codex ; exec bash'" ;;
+    cdx-2)
+      echo "bash -lc 'cd ~/dev/codex-bridge ; CODEX_HOME=$HOME/.codex-cdx-2 codex ; exec bash'" ;;
+    cdx-3)
+      echo "bash -lc 'cd ~/dev/codex-bridge ; CODEX_HOME=$HOME/.codex-cdx-3 codex ; exec bash'" ;;
+    gem-1)
+      # auto_edit (NOT yolo — yolo can wipe files; reddit horror stories).
+      # auto_edit auto-approves edit tools; shell prompts get caught + approved
+      # by work's runtime guard. Pinned model + GEMINI.md guard rails.
+      echo "bash -lc 'cd ~/dev/gem-session 2>/dev/null || cd ~ ; gemini --approval-mode auto_edit --model gemini-3.1-pro-preview ; echo \"--- exited \$? ---\" ; exec bash'" ;;
+    kimi)
+      # OpenCode Go subscription, Kimi K2.6 (3x limits) — see ~/dev/kimi-session/AGENTS.md
+      echo "bash -lc 'cd ~/dev/kimi-session ; $HOME/.opencode/bin/opencode -m opencode-go/kimi-k2.6 ; echo \"--- exited \$? ---\" ; exec bash'" ;;
+    deepseek)
+      # OpenCode Go subscription, DeepSeek V4 Pro — see ~/dev/deepseek-session/AGENTS.md
+      echo "bash -lc 'cd ~/dev/deepseek-session ; $HOME/.opencode/bin/opencode -m opencode-go/deepseek-v4-pro ; echo \"--- exited \$? ---\" ; exec bash'" ;;
+    *)
+      echo ""; return 1 ;;
+  esac
+}
+
+echo "▶ Targets: ${TARGETS[*]}"
+[ "$DRY_RUN" -eq 1 ] && echo "▶ DRY RUN — no sessions will be killed or spawned"
+echo
+
+for sess in "${TARGETS[@]}"; do
+  cmd=$(launch_for "$sess") || {
+    echo "  ✗ $sess — unknown session name, skipping"
+    continue
+  }
+
+  # Pre-flight: warn if session has active work (basic heuristic)
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    pane_tail=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -8 || true)
+    if echo "$pane_tail" | grep -qiE "Working|Thinking|in progress|generating"; then
+      echo "  ⚠ $sess has activity in pane — review before restart:"
+      echo "$pane_tail" | sed 's/^/      /'
+      if [ "$DRY_RUN" -eq 0 ]; then
+        read -r -p "    Restart $sess anyway? [y/N] " yn </dev/tty || yn=n
+        case "$yn" in
+          y|Y) ;;
+          *) echo "  ↷ skipping $sess"; continue ;;
+        esac
+      fi
+    fi
+  fi
+
+  echo "  ⌫ killing $sess"
+  [ "$DRY_RUN" -eq 0 ] && tmux kill-session -t "$sess" 2>/dev/null || true
+  sleep 1
+
+  echo "  ▶ launching $sess"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    tmux new-session -d -s "$sess" -x 200 -y 50 "$cmd"
+    sleep 3
+    tmux has-session -t "$sess" && echo "  ✓ $sess alive" || echo "  ✗ $sess FAILED to launch"
+  else
+    echo "      cmd: $cmd"
+  fi
+  echo
+done
+
+echo "═════════════════════════════════════════════"
+[ "$DRY_RUN" -eq 0 ] && {
+  echo "Final status:"
+  agent-status 2>&1 | head -12 | sed 's/^/  /'
+}

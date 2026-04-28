@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "_comment": "GodModeSkill opencode permissions — file ops auto-approved, bash/task asks (work runtime guard catches and approves safe ones, refuses destructive). external_directory MUST be allow so reviewers can read /tmp/work-* packs and write findings.",
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "lsp": "allow",
+    "todowrite": "allow",
+    "websearch": "allow",
+    "webfetch": "allow",
+    "external_directory": "allow",
+    "codesearch": "allow",
+    "skill": "allow",
+    "question": "allow",
+    "bash": "ask",
+    "task": "ask"
+  }
+}

@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""
+work-pack-build — assemble an XML review pack for /work.
+
+Modes:
+  plan      → context: arch docs + memory + journals + planning dir; no diff
+  implement → context: relevant code + plan doc; with diff if present
+  major-bug → context: failing test + relevant code + diff
+  minor-bug → not invoked (no review)
+
+Reads stdin / args, writes one XML file. Reviewer LLMs parse it.
+Output goes to <out>/pack.xml (path printed on stdout).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import xml.sax.saxutils as sx
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+# Claude Code stores per-project memory under ~/.claude/projects/<slug>/memory/
+# where <slug> = absolute cwd with /'s replaced by -'s.
+JOURNAL_DIR = HOME / ".claude/conversations"
+
+
+def project_memory_dir(cwd: Path) -> Path:
+    """Compute the per-project memory dir for the current cwd."""
+    slug = str(cwd.resolve()).replace("/", "-")
+    return HOME / ".claude/projects" / slug / "memory"
+
+MAX_CTX_BYTES = 200_000  # cap pack size — prevents 1MB packs blowing reviewer ctx
+MAX_FILE_BYTES = 30_000  # per-file cap when including code
+MAX_JOURNAL_ENTRIES = 5  # most recent entries from any matched journal
+
+
+def esc(s: str) -> str:
+    return sx.escape(s if isinstance(s, str) else str(s))
+
+
+def cdata(s: str) -> str:
+    """Wrap in CDATA, splitting if it contains the closing sequence."""
+    if s is None:
+        return ""
+    s = str(s).replace("]]>", "]]]]><![CDATA[>")
+    return f"<![CDATA[{s}]]>"
+
+
+def run(cmd: list[str], check: bool = False, cwd: Path | None = None) -> str:
+    """Run a command, return stdout. Empty string on failure unless check=True."""
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=30, check=check
+        )
+        return r.stdout
+    except Exception:
+        if check:
+            raise
+        return ""
+
+
+def keywords_from_task(task: str) -> list[str]:
+    """Extract significant words from task text for grep matching."""
+    # Drop common words; keep nouns/identifiers (anything ≥4 chars, alnum/_)
+    stop = {
+        "the", "and", "for", "with", "into", "from", "that", "this", "have",
+        "been", "will", "should", "would", "could", "make", "need", "want",
+        "feature", "task", "review", "implement", "build", "create", "fix",
+        "bug", "issue", "code", "test", "tests", "work", "plan", "needs",
+    }
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", task.lower())
+    seen, out = set(), []
+    for w in words:
+        if w in stop or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def discover_memory_files(keywords: list[str], cwd: Path, limit: int = 6) -> list[Path]:
+    """Find memory files whose name OR description matches any keyword."""
+    memory_dir = project_memory_dir(cwd)
+    if not memory_dir.exists() or not keywords:
+        return []
+    matches: dict[Path, int] = {}
+    for f in memory_dir.glob("*.md"):
+        if f.name.startswith("_session_") or f.name == "MEMORY.md":
+            continue
+        score = 0
+        name_lower = f.name.lower()
+        for kw in keywords:
+            if kw in name_lower:
+                score += 3  # name match worth more
+        # Read first 10 lines (frontmatter + first body line) for description match
+        try:
+            head = "\n".join(f.read_text(errors="replace").splitlines()[:10]).lower()
+            for kw in keywords:
+                if kw in head:
+                    score += 1
+        except Exception:
+            pass
+        if score > 0:
+            matches[f] = score
+    return [p for p, _ in sorted(matches.items(), key=lambda kv: -kv[1])[:limit]]
+
+
+def discover_journals(keywords: list[str], limit: int = 3) -> list[tuple[Path, list[str]]]:
+    """Find journals matching keywords; return (path, list-of-matching-entries)."""
+    if not JOURNAL_DIR.exists() or not keywords:
+        return []
+    out = []
+    for f in sorted(JOURNAL_DIR.glob("*.md")):
+        try:
+            text = f.read_text(errors="replace")
+        except Exception:
+            continue
+        text_lower = text.lower()
+        if not any(kw in text_lower for kw in keywords):
+            continue
+        # Extract matching entries (### blocks)
+        entries = re.split(r"^### ", text, flags=re.MULTILINE)
+        matching = []
+        for e in entries[1:]:  # skip preamble
+            e_lower = e.lower()
+            if any(kw in e_lower for kw in keywords):
+                # Title is the first line; truncate body
+                lines = e.splitlines()
+                title = lines[0]
+                body = "\n".join(lines[1:])[:2000]
+                matching.append(f"### {title}\n{body}")
+        if matching:
+            out.append((f, matching[:MAX_JOURNAL_ENTRIES]))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def find_planning_dir(cwd: Path) -> Path | None:
+    """Walk up from cwd looking for a planning/ directory."""
+    p = cwd.resolve()
+    while p != p.parent:
+        cand = p / "planning"
+        if cand.is_dir():
+            return cand
+        p = p.parent
+    return None
+
+
+def find_arch_docs(cwd: Path) -> list[Path]:
+    """Locate CLAUDE.md, planning/CODING-PRINCIPLES.md, README.md, etc."""
+    candidates = []
+    p = cwd.resolve()
+    while p != p.parent:
+        for name in ("CLAUDE.md", "README.md"):
+            f = p / name
+            if f.is_file():
+                candidates.append(f)
+        for name in ("CODING-PRINCIPLES.md", "ARCHITECTURE.md", "PAGE-TEMPLATE.md"):
+            f = p / "planning" / name
+            if f.is_file():
+                candidates.append(f)
+        p = p.parent
+    # de-dupe preserving order
+    seen, out = set(), []
+    for f in candidates:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def get_git_diff(ref: str | None) -> str:
+    """Diff vs given ref or merge-base with main."""
+    if ref:
+        return run(["git", "diff", ref])
+    base = run(["git", "merge-base", "HEAD", "main"]).strip() or \
+           run(["git", "merge-base", "HEAD", "master"]).strip()
+    if base:
+        return run(["git", "diff", base])
+    return run(["git", "diff", "HEAD"])
+
+
+def get_changed_files(ref: str | None) -> list[Path]:
+    """List of files changed in the working tree vs ref/main."""
+    if ref:
+        out = run(["git", "diff", "--name-only", ref])
+    else:
+        base = run(["git", "merge-base", "HEAD", "main"]).strip() or \
+               run(["git", "merge-base", "HEAD", "master"]).strip()
+        out = run(["git", "diff", "--name-only", base]) if base else \
+              run(["git", "diff", "--name-only", "HEAD"])
+    return [Path(p) for p in out.splitlines() if p.strip()]
+
+
+def read_capped(p: Path, cap: int = MAX_FILE_BYTES) -> str:
+    try:
+        data = p.read_text(errors="replace")
+    except Exception as e:
+        return f"[unreadable: {e}]"
+    if len(data) > cap:
+        return data[:cap] + f"\n[... truncated, {len(data) - cap} bytes omitted]"
+    return data
+
+
+def emit_pack(args, ctx: dict) -> str:
+    """Build the XML string."""
+    parts = []
+    parts.append('<?xml version="1.0" encoding="UTF-8"?>')
+    parts.append(
+        f'<review-pack mode="{esc(args.mode)}" round="{args.round}" '
+        f'task-id="{esc(args.task_id)}" '
+        f'created="{datetime.now(timezone.utc).isoformat()}">'
+    )
+
+    # Task
+    parts.append("  <task>")
+    parts.append(f"    {cdata(args.task)}")
+    parts.append("  </task>")
+
+    # Context
+    parts.append("  <context>")
+
+    # Architecture / coding-principle docs
+    if ctx["arch_docs"]:
+        parts.append("    <architecture-docs>")
+        for f in ctx["arch_docs"]:
+            parts.append(f'      <doc path="{esc(str(f))}">{cdata(read_capped(f))}</doc>')
+        parts.append("    </architecture-docs>")
+
+    # Planning docs
+    if ctx["planning_docs"]:
+        parts.append("    <planning-docs>")
+        for f in ctx["planning_docs"]:
+            parts.append(f'      <doc path="{esc(str(f))}">{cdata(read_capped(f, 10_000))}</doc>')
+        parts.append("    </planning-docs>")
+
+    # Related memory
+    if ctx["memory_files"]:
+        parts.append("    <related-memory>")
+        for f in ctx["memory_files"]:
+            parts.append(f'      <memory file="{esc(f.name)}">{cdata(read_capped(f, 5_000))}</memory>')
+        parts.append("    </related-memory>")
+
+    # Related journals
+    if ctx["journals"]:
+        parts.append("    <related-journals>")
+        for f, entries in ctx["journals"]:
+            parts.append(f'      <journal name="{esc(f.stem)}" matched-entries="{len(entries)}">')
+            for e in entries:
+                parts.append(f"        <entry>{cdata(e)}</entry>")
+            parts.append("      </journal>")
+        parts.append("    </related-journals>")
+
+    # Relevant code (changed files for implement/bug modes)
+    if ctx["code_files"]:
+        parts.append("    <relevant-code>")
+        for f in ctx["code_files"]:
+            if not f.exists():
+                continue
+            parts.append(f'      <file path="{esc(str(f))}">{cdata(read_capped(f))}</file>')
+        parts.append("    </relevant-code>")
+
+    # Failing test (major-bug mode)
+    if ctx.get("failing_test"):
+        parts.append(f'    <failing-test path="{esc(ctx["failing_test"]["path"])}">')
+        parts.append(f"      <test-code>{cdata(ctx['failing_test']['code'])}</test-code>")
+        parts.append(f"      <test-output>{cdata(ctx['failing_test']['output'])}</test-output>")
+        parts.append("    </failing-test>")
+
+    # Diff
+    if ctx.get("diff"):
+        parts.append("    <diff>")
+        parts.append(f"      {cdata(ctx['diff'])}")
+        parts.append("    </diff>")
+
+    parts.append("  </context>")
+
+    # Prior rounds
+    if args.prior_rounds_file and Path(args.prior_rounds_file).exists():
+        parts.append("  <prior-rounds>")
+        parts.append(f"    {cdata(Path(args.prior_rounds_file).read_text(errors='replace'))}")
+        parts.append("  </prior-rounds>")
+
+    # Ask — explicit instructions for the reviewer
+    ask = build_ask(args.mode, args.round)
+    parts.append("  <ask>")
+    parts.append(f"    {cdata(ask)}")
+    parts.append("  </ask>")
+
+    # Response schema — what the reviewer must return
+    parts.append("  <response-schema>")
+    parts.append(f"    {cdata(RESPONSE_SCHEMA)}")
+    parts.append("  </response-schema>")
+
+    parts.append("</review-pack>")
+    return "\n".join(parts)
+
+
+def build_ask(mode: str, round_n: int) -> str:
+    base = (
+        "Independently form your own conclusion. Do NOT anchor on any proposal "
+        "in the pack — verify each claim against the source you are given. "
+        "Use the <context> blocks for background; do your own discovery if needed.\n\n"
+    )
+    if mode == "plan":
+        specific = (
+            "PLAN MODE — review the proposed approach.\n"
+            "  • Does the plan address the task?\n"
+            "  • Does it respect the architecture docs and prior decisions in <related-memory>?\n"
+            "  • Are there simpler/cheaper alternatives?\n"
+            "  • What edge cases are missing?\n"
+            "  • Risks not surfaced?\n"
+        )
+    elif mode == "implement":
+        specific = (
+            "IMPLEMENT MODE — review the code in <diff> against the plan in <planning-docs>.\n"
+            "  • Does the diff implement the plan as agreed?\n"
+            "  • Drift from the plan? If so, justified?\n"
+            "  • Bugs, security issues, performance traps?\n"
+            "  • Tests adequate?\n"
+            "  • Style/architecture violations vs <architecture-docs>?\n"
+        )
+    elif mode == "major-bug":
+        specific = (
+            "MAJOR-BUG MODE — review the diagnosis AND the fix.\n"
+            "  • Does the failing test in <failing-test> capture the actual bug?\n"
+            "  • Is the proposed root cause correct, or a symptom?\n"
+            "  • Will the fix in <diff> regress anything in <relevant-code>?\n"
+            "  • Are tests sufficient (only the failing test, or are wider regressions possible)?\n"
+        )
+    else:
+        specific = ""
+
+    if round_n > 1:
+        round_note = (
+            f"\nROUND {round_n}: read <prior-rounds> first. Has the proposer addressed "
+            "your previous findings? If yes, agree. If no, restate what's still wrong "
+            "and why. Don't invent NEW critiques unless the revised proposal opened them.\n"
+        )
+    else:
+        round_note = ""
+
+    return base + specific + round_note + (
+        "\nReturn your response in EXACTLY the XML format under <response-schema>. "
+        "End your file with a single line: ## DONE"
+    )
+
+
+RESPONSE_SCHEMA = """\
+<findings>
+  <finding severity="critical|high|medium|low" category="bug|security|architecture|performance|style|test|other">
+    <claim>One-sentence description of the issue.</claim>
+    <evidence>File path, line number, or quote from the pack supporting the claim.</evidence>
+    <suggestion>What you would do differently.</suggestion>
+  </finding>
+  <!-- repeat <finding> as needed; omit if nothing to flag -->
+  <verdict agree="true|false|partial">
+    <reasoning>One paragraph: why agree, why not, or what partial means.</reasoning>
+  </verdict>
+</findings>
+
+## DONE
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--mode", required=True, choices=["plan", "implement", "major-bug"])
+    ap.add_argument("--task", required=True, help="task text (plan: feature description; implement: what was built; bug: bug description)")
+    ap.add_argument("--task-id", required=True, help="stable task identifier (e.g. branch name)")
+    ap.add_argument("--round", type=int, default=1)
+    ap.add_argument("--out", required=True, help="output dir; pack written to <out>/pack.xml")
+    ap.add_argument("--diff-ref", default=None, help="git ref for diff (default: merge-base with main)")
+    ap.add_argument("--prior-rounds-file", default=None, help="path to a markdown file containing prior rounds' summaries")
+    ap.add_argument("--planning-doc", default=None, help="explicit path to the plan doc to include")
+    ap.add_argument("--failing-test", default=None, help="path to the failing test file (major-bug mode)")
+    ap.add_argument("--failing-test-output", default=None, help="path to file with the failing test's output")
+    ap.add_argument("--extra-files", default="", help="comma-separated extra files to include in <relevant-code>")
+    args = ap.parse_args()
+
+    cwd = Path.cwd()
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build context dict
+    keywords = keywords_from_task(args.task)
+    ctx = {
+        "arch_docs": find_arch_docs(cwd) if args.mode == "plan" else find_arch_docs(cwd)[:2],
+        "planning_docs": [],
+        "memory_files": discover_memory_files(keywords, cwd),
+        "journals": discover_journals(keywords),
+        "code_files": [],
+        "diff": "",
+    }
+
+    # Mode-specific augmentation
+    if args.planning_doc and Path(args.planning_doc).exists():
+        ctx["planning_docs"].append(Path(args.planning_doc))
+    elif args.mode == "plan":
+        # Pull recently-modified planning docs from planning/ dir
+        plan_dir = find_planning_dir(cwd)
+        if plan_dir:
+            recents = sorted(plan_dir.glob("*.md"), key=lambda p: -p.stat().st_mtime)[:3]
+            ctx["planning_docs"].extend(recents)
+
+    if args.mode in ("implement", "major-bug"):
+        ctx["diff"] = get_git_diff(args.diff_ref)
+        # Code context = changed files (capped by size)
+        for f in get_changed_files(args.diff_ref):
+            if f.exists() and f.suffix in (".py", ".ts", ".tsx", ".js", ".jsx", ".sql", ".go", ".rs", ".sh", ".bash"):
+                ctx["code_files"].append(f)
+            if len(ctx["code_files"]) >= 10:
+                break
+
+    if args.mode == "major-bug" and args.failing_test:
+        test_path = Path(args.failing_test)
+        if test_path.exists():
+            output = ""
+            if args.failing_test_output and Path(args.failing_test_output).exists():
+                output = Path(args.failing_test_output).read_text(errors="replace")[:10_000]
+            ctx["failing_test"] = {
+                "path": str(test_path),
+                "code": read_capped(test_path),
+                "output": output,
+            }
+
+    if args.extra_files:
+        for raw in args.extra_files.split(","):
+            p = Path(raw.strip())
+            if p.exists() and p not in ctx["code_files"]:
+                ctx["code_files"].append(p)
+
+    # Build XML
+    xml = emit_pack(args, ctx)
+
+    # Cap total size — drop journals first, then memory, if we exceed
+    if len(xml) > MAX_CTX_BYTES:
+        ctx["journals"] = ctx["journals"][:1]
+        xml = emit_pack(args, ctx)
+    if len(xml) > MAX_CTX_BYTES:
+        ctx["memory_files"] = ctx["memory_files"][:2]
+        xml = emit_pack(args, ctx)
+    if len(xml) > MAX_CTX_BYTES:
+        # Last resort: truncate diff
+        if ctx.get("diff"):
+            ctx["diff"] = ctx["diff"][:50_000] + "\n[diff truncated for size]"
+            xml = emit_pack(args, ctx)
+
+    pack_path = out_dir / "pack.xml"
+    pack_path.write_text(xml)
+
+    print(json.dumps({
+        "pack": str(pack_path),
+        "bytes": len(xml),
+        "context": {
+            "arch_docs": [str(p) for p in ctx["arch_docs"]],
+            "planning_docs": [str(p) for p in ctx["planning_docs"]],
+            "memory_files": [p.name for p in ctx["memory_files"]],
+            "journals": [p[0].stem for p in ctx["journals"]],
+            "code_files": [str(p) for p in ctx["code_files"]],
+            "diff_bytes": len(ctx.get("diff") or ""),
+            "keywords_used": keywords,
+        },
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+# work — multi-LLM workflow orchestrator with lineage-weighted quorum.
+#
+# This tool is the executor. The /work SLASH COMMAND drives it from Claude Code.
+# It does ONE phase at a time (called by Claude as needed). It does NOT loop
+# end-to-end on its own — Claude is the conductor.
+#
+# Subcommands:
+#   work pick-agents [--exclude <a,b>]
+#       → picks 1 codex + 1 gemini + 1 opencode (LRU-rotated). Prints JSON.
+#
+#   work review --mode plan|implement|major-bug --task "..." --task-id <id>
+#               --round <N> [--planning-doc <path>] [--failing-test <path>]
+#               [--failing-test-output <path>] [--diff-ref <ref>]
+#               [--prior-rounds-file <path>] [--extra-files a,b,c]
+#               [--agents <a,b,c>] [--out <dir>] [--timeout <sec>]
+#       → builds XML pack, decides /clear (vs last task), nudges agents,
+#         BLOCKS on inotifywait until all reviewers write `## DONE`,
+#         runs work-converge, prints JSON with decision + per-agent findings.
+#
+#   work state-get
+#       → prints ~/.work/state.json
+#
+#   work state-set --task-id <id>
+#       → records last task; subsequent `work review` will diff against this
+#         to decide whether to /clear reviewer context.
+#
+#   work clean [--older-than <days>] [--dry-run]
+#       → purges /tmp/work-* dirs older than N days (default 7).
+#         Use --dry-run to preview without deleting.
+#
+# State file: ~/.work/state.json
+#   { "last_task_id": "...", "last_round": {...}, "last_agents": [...] }
+
+set -euo pipefail
+
+AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
+STATE_DIR="$HOME/.work"
+STATE_FILE="$STATE_DIR/state.json"
+LRU_FILE="$STATE_DIR/agent-lru.json"
+sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
+sudo chown -R "$USER:$USER" "$STATE_DIR" 2>/dev/null || true
+[ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
+[ -f "$LRU_FILE"   ] || echo '{}' > "$LRU_FILE"
+
+[ -f "$AGENTS_JSON" ] || { echo "work: missing $AGENTS_JSON" >&2; exit 1; }
+# inotifywait is required only by `work review`; checked inside cmd_review.
+
+# ── pick-agents subcommand ───────────────────────────────────────────────
+cmd_pick_agents() {
+  local exclude=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --exclude) exclude="$2"; shift 2 ;;
+      *) echo "work pick-agents: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # For each lineage, pick the alive agent with the oldest last_used_at (LRU).
+  python3 - <<PYEOF
+import json, subprocess, sys
+from pathlib import Path
+
+agents = json.loads(Path("$AGENTS_JSON").read_text())["agents"]
+lru = json.loads(Path("$LRU_FILE").read_text())
+exclude = set("$exclude".split(",")) if "$exclude" else set()
+
+# Check tmux liveness
+def alive(session):
+    r = subprocess.run(["tmux", "has-session", "-t", session],
+                       capture_output=True)
+    return r.returncode == 0
+
+picked = {}
+for lineage in ("codex", "gemini", "opencode"):
+    pool = [
+        a for a in agents
+        if a["type"] == lineage
+        and a["name"] not in exclude
+        and alive(a["tmux_session"])
+    ]
+    if not pool:
+        print(json.dumps({"error": f"no alive {lineage} agent available",
+                          "exclude": list(exclude)}), file=sys.stderr)
+        sys.exit(1)
+    # Sort by last_used_at (oldest first); never-used = epoch 0
+    pool.sort(key=lambda a: lru.get(a["name"], "1970-01-01T00:00:00Z"))
+    picked[lineage] = pool[0]["name"]
+
+print(json.dumps(picked, indent=2))
+PYEOF
+}
+
+# ── state-get subcommand ─────────────────────────────────────────────────
+cmd_state_get() {
+  cat "$STATE_FILE"
+}
+
+# ── clean subcommand ─────────────────────────────────────────────────────
+cmd_clean() {
+  local days=7 dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --older-than) days="$2"; shift 2 ;;
+      --dry-run)    dry=1; shift ;;
+      *) echo "work clean: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # Find /tmp/work-* dirs older than $days days (mtime), print + optionally rm
+  local found=0 freed=0
+  while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    local sz_kb
+    sz_kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+    found=$((found + 1))
+    freed=$((freed + sz_kb))
+    if [ "$dry" -eq 1 ]; then
+      printf '  (dry) %s  (%d KB)\n' "$d" "$sz_kb"
+    else
+      printf '  rm    %s  (%d KB)\n' "$d" "$sz_kb"
+      rm -rf -- "$d"
+    fi
+  done < <(find /tmp -maxdepth 1 -type d -name 'work-*' -mtime "+$days" 2>/dev/null)
+
+  if [ "$found" -eq 0 ]; then
+    echo "no /tmp/work-* dirs older than ${days}d"
+  else
+    if [ "$dry" -eq 1 ]; then
+      echo "▶ ${found} dir(s), ~$((freed / 1024)) MB would be freed (dry run)"
+    else
+      echo "▶ removed ${found} dir(s), freed ~$((freed / 1024)) MB"
+    fi
+  fi
+}
+
+# ── state-set subcommand ─────────────────────────────────────────────────
+cmd_state_set() {
+  local task_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task-id) task_id="$2"; shift 2 ;;
+      *) echo "work state-set: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  [ -z "$task_id" ] && { echo "work state-set: --task-id required" >&2; exit 2; }
+  python3 - <<PYEOF
+import json
+from pathlib import Path
+s = json.loads(Path("$STATE_FILE").read_text() or "{}")
+s["last_task_id"] = "$task_id"
+Path("$STATE_FILE").write_text(json.dumps(s, indent=2))
+PYEOF
+}
+
+# ── review subcommand (the main event) ───────────────────────────────────
+cmd_review() {
+  command -v inotifywait >/dev/null || {
+    echo "work review: inotifywait required (sudo apt install inotify-tools)" >&2
+    exit 1
+  }
+  local mode="" task="" task_id="" round=1 out=""
+  local planning_doc="" failing_test="" failing_test_output=""
+  local diff_ref="" prior_rounds_file="" extra_files=""
+  # 10-minute hard cap. Anything longer wastes Claude's context on stale waits.
+  # Override per-call with --timeout <sec> if a specific review needs more.
+  local agents="" timeout=600
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode)                mode="$2"; shift 2 ;;
+      --task)                task="$2"; shift 2 ;;
+      --task-id)             task_id="$2"; shift 2 ;;
+      --round)               round="$2"; shift 2 ;;
+      --out)                 out="$2"; shift 2 ;;
+      --planning-doc)        planning_doc="$2"; shift 2 ;;
+      --failing-test)        failing_test="$2"; shift 2 ;;
+      --failing-test-output) failing_test_output="$2"; shift 2 ;;
+      --diff-ref)            diff_ref="$2"; shift 2 ;;
+      --prior-rounds-file)   prior_rounds_file="$2"; shift 2 ;;
+      --extra-files)         extra_files="$2"; shift 2 ;;
+      --agents)              agents="$2"; shift 2 ;;
+      --timeout)             timeout="$2"; shift 2 ;;
+      *) echo "work review: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+
+  [ -z "$mode" ]    && { echo "work review: --mode required" >&2; exit 2; }
+  [ -z "$task" ]    && { echo "work review: --task required" >&2; exit 2; }
+  [ -z "$task_id" ] && { echo "work review: --task-id required" >&2; exit 2; }
+
+  # Auto-pick agents if not provided
+  if [ -z "$agents" ]; then
+    local picks
+    picks=$(cmd_pick_agents) || { echo "$picks" >&2; exit 2; }
+    agents=$(echo "$picks" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(d.values()))')
+  fi
+
+  # Default out dir
+  ts="$(date +%Y%m%d-%H%M%S)"
+  [ -z "$out" ] && out="/tmp/work-${task_id//\//-}-r${round}-$ts"
+  mkdir -p "$out"
+
+  # Decide: should we /clear first? (different task_id from last invocation)
+  local last_task_id
+  last_task_id=$(python3 -c 'import json; print(json.load(open("'"$STATE_FILE"'")).get("last_task_id",""))')
+  local clear_first=0
+  if [ -n "$last_task_id" ] && [ "$last_task_id" != "$task_id" ]; then
+    clear_first=1
+  fi
+
+  # Build pack
+  local pack_args=(
+    --mode "$mode"
+    --task "$task"
+    --task-id "$task_id"
+    --round "$round"
+    --out "$out"
+  )
+  [ -n "$planning_doc" ]         && pack_args+=(--planning-doc "$planning_doc")
+  [ -n "$failing_test" ]         && pack_args+=(--failing-test "$failing_test")
+  [ -n "$failing_test_output" ]  && pack_args+=(--failing-test-output "$failing_test_output")
+  [ -n "$diff_ref" ]             && pack_args+=(--diff-ref "$diff_ref")
+  [ -n "$prior_rounds_file" ]    && pack_args+=(--prior-rounds-file "$prior_rounds_file")
+  [ -n "$extra_files" ]          && pack_args+=(--extra-files "$extra_files")
+
+  local pack_meta
+  pack_meta=$($HOME/.local/bin/work-pack-build "${pack_args[@]}") || {
+    echo "work: pack build failed" >&2; exit 1
+  }
+  local pack_path
+  pack_path=$(echo "$pack_meta" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pack"])')
+  echo "$pack_meta" > "$out/pack-meta.json"
+
+  echo "▶ Mode: $mode  |  Task: $task_id  |  Round: $round" >&2
+  echo "▶ Agents: $agents" >&2
+  echo "▶ Pack: $pack_path ($(wc -c <"$pack_path") bytes)" >&2
+  echo "▶ Out:  $out" >&2
+  [ "$clear_first" -eq 1 ] && echo "▶ /clear: ON (task_id changed: '$last_task_id' → '$task_id')" >&2
+  [ "$clear_first" -eq 0 ] && [ -n "$last_task_id" ] && echo "▶ /clear: OFF (same task as last: $task_id)" >&2
+
+  # Resolve agents → tmux sessions, nudge commands, types
+  IFS=',' read -ra AGENT_LIST <<<"$agents"
+  declare -A NUDGE ENVVAR SESS TYPE
+  VALID=()
+  for raw in "${AGENT_LIST[@]}"; do
+    name="${raw// /}"
+    row=$(jq -c --arg n "$name" '.agents[] | select(.name == $n)' "$AGENTS_JSON")
+    [ -z "$row" ] && { echo "  ✗ $name not in agents.json (skipping)" >&2; continue; }
+    NUDGE[$name]=$(jq -r '.nudge_command' <<<"$row")
+    ENVVAR[$name]=$(jq -r '.tmux_env_var' <<<"$row")
+    SESS[$name]=$(jq -r '.tmux_session' <<<"$row")
+    TYPE[$name]=$(jq -r '.type' <<<"$row")
+    if ! tmux has-session -t "${SESS[$name]}" 2>/dev/null; then
+      echo "  ✗ $name tmux session ${SESS[$name]} not alive (skipping)" >&2
+      continue
+    fi
+    VALID+=("$name")
+  done
+  [ ${#VALID[@]} -eq 0 ] && { echo "work: no usable agents" >&2; exit 1; }
+
+  # /clear policy:
+  #   • ALL agents: /clear when task_id changed (clear_first=1) — different work entirely.
+  #   • OPENCODE agents (kimi/deepseek): ALWAYS /clear, even within same task / same round.
+  #     Reason: opencode TUIs preserve conversation history across nudges, which causes
+  #     the reviewer to drift conversational ("what would you like me to do with this?")
+  #     instead of treating each nudge as a fresh directive. Cross-round context is
+  #     preserved via <prior-rounds> in the XML pack, NOT via session memory.
+  #   • Codex + Gemini: respect clear_first only — they're directive enough to handle
+  #     in-session context without drifting.
+  for name in "${VALID[@]}"; do
+    needs_clear=0
+    [ "$clear_first" -eq 1 ] && needs_clear=1
+    [ "${TYPE[$name]}" = "opencode" ] && needs_clear=1
+    if [ "$needs_clear" -eq 1 ]; then
+      reason="task changed"
+      [ "$clear_first" -eq 0 ] && reason="opencode always-clear"
+      echo "  ⌫ /clear → $name ($reason)" >&2
+      tmux send-keys -t "${SESS[$name]}" "/clear" Enter 2>/dev/null || true
+      sleep 1
+    fi
+  done
+  # Brief settle if anything was cleared
+  if [ "$clear_first" -eq 1 ] || [ "${#VALID[@]}" -gt 0 ]; then
+    # Only settle if at least one opencode or task changed
+    for name in "${VALID[@]}"; do
+      if [ "${TYPE[$name]}" = "opencode" ] || [ "$clear_first" -eq 1 ]; then
+        sleep 2
+        break
+      fi
+    done
+  fi
+
+  # Send the nudge to each agent
+  for name in "${VALID[@]}"; do
+    out_file="$out/${name}-findings.md"
+    prompt="Please review the XML context pack at: $pack_path
+
+Read it carefully — the <ask> block tells you what to do, the <response-schema> block tells you the EXACT XML format to return.
+
+When you finish, write your full response to: $out_file
+
+CRITICAL — to avoid permission prompts:
+  • Use your file-write tool (write_file / edit / Write) to create the findings file.
+  • Do NOT use shell commands like 'cat <<EOF >file', 'echo >file', 'tee', or 'printf >file' — those are 'shell' tools that prompt for permission and will block this orchestrator.
+  • If your CLI only has shell, that's OK — just answer the permission prompt yourself; the orchestrator will detect and auto-approve safe writes.
+
+End your file with a single line containing exactly: ## DONE
+
+Failure to end with '## DONE' will leave the orchestrator hanging — please double-check before stopping."
+
+    # Opencode TUIs (kimi, deepseek) tend to ask clarifying questions instead
+    # of executing directly. Append a forcing directive so they treat this as
+    # a non-interactive task. Codex + Gemini are already directive enough.
+    if [ "${TYPE[$name]}" = "opencode" ]; then
+      prompt="$prompt
+
+ADDITIONAL — opencode reviewer directive:
+You are the reviewer for round $round of this task. Begin reviewing IMMEDIATELY. Do NOT ask clarifying questions. Do NOT respond conversationally. Your FIRST action must be reading the pack.xml; your LAST action must be writing the findings file ending with '## DONE'."
+    fi
+
+    printf '# Findings — %s\n\n_(in progress, started %s)_\n' "$name" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$out_file"
+    echo "→ nudging $name (tmux ${SESS[$name]})" >&2
+    env "${ENVVAR[$name]}=${SESS[$name]}" "${NUDGE[$name]}" "$prompt" >/dev/null
+
+    # Update LRU
+    python3 - <<PYEOF
+import json, datetime
+from pathlib import Path
+lru = json.loads(Path("$LRU_FILE").read_text() or "{}")
+lru["$name"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+Path("$LRU_FILE").write_text(json.dumps(lru, indent=2))
+PYEOF
+  done
+
+  # ── Wait for ALL findings files to end with `## DONE` ──────────────────
+  # Strategy: blocking inotifywait → zero CPU, zero token burn during wait.
+  # Re-check after each filesystem event. Hard cap: $timeout seconds.
+  echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (zero-poll, event-driven)" >&2
+
+  local start now elapsed
+  start=$(date +%s)
+  while :; do
+    local done_count=0
+    for name in "${VALID[@]}"; do
+      if tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$'; then
+        done_count=$((done_count + 1))
+      fi
+    done
+
+    if [ "$done_count" -eq "${#VALID[@]}" ]; then
+      break
+    fi
+
+    now=$(date +%s); elapsed=$((now - start))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      echo "  ✗ TIMEOUT after ${elapsed}s ($done_count/${#VALID[@]} done)" >&2
+      break
+    fi
+
+    # Check for permission prompts in any reviewer pane while we wait
+    for name in "${VALID[@]}"; do
+      check_and_approve_prompts "$name" >&2
+    done
+
+    # Block until ANY findings file changes (or timeout). 15s safety wake to
+    # re-check permission prompts — catches stuck-on-prompt reviewers within
+    # 15s instead of the previous 60s.
+    inotifywait -qq -e modify -e create "$out/" --timeout 15 2>/dev/null || true
+  done
+
+  echo "  ✓ All ${done_count}/${#VALID[@]} reviewers done in ${elapsed}s" >&2
+
+  # ── Run convergence check ─────────────────────────────────────────────
+  local converge_json
+  converge_json=$($HOME/.local/bin/work-converge --out-dir "$out" --agents "$agents" 2>&1) || {
+    # Non-zero exit codes are fine (1 = disagree, 2 = incomplete) — we still want the JSON
+    :
+  }
+
+  echo "$converge_json" > "$out/converge.json"
+
+  # Update state
+  python3 - <<PYEOF
+import json
+from pathlib import Path
+s = json.loads(Path("$STATE_FILE").read_text() or "{}")
+s["last_task_id"] = "$task_id"
+s.setdefault("last_round", {})["$task_id"] = $round
+s["last_agents"] = "$agents".split(",")
+Path("$STATE_FILE").write_text(json.dumps(s, indent=2))
+PYEOF
+
+  # Print the converge JSON to stdout (Claude consumes this)
+  echo "$converge_json"
+
+  # Exit code mirrors converge: 0 agree, 1 disagree, 2 incomplete
+  local decision
+  decision=$(echo "$converge_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["decision"])' 2>/dev/null || echo "incomplete")
+  case "$decision" in
+    agree) exit 0 ;;
+    disagree) exit 1 ;;
+    *) exit 2 ;;
+  esac
+}
+
+# ── Permission prompt detection — second line of defense ────────────────
+# First line: CLI configs (gemini auto_edit, opencode read/edit=allow,
+# codex sandbox-write). This guard is for prompts that escape those defaults
+# (e.g. shell commands like cat/tee that gemini/opencode treat as "shell").
+PROMPT_RE='Allow this|Allow execution|Allow for this session|Allow once|Allow always|Approve this|Run this command\?|Proceed\?|Confirm \(y/N\)|\[y/N\]|\(y/n\)|◐ accept|❯ Yes|Apply this|Execute this|Allow \[|Permission required|Access external'
+
+# Numbered-prompt detection (gemini): "1. Allow once / 2. Allow for this session / 3. No"
+NUMBERED_PROMPT_RE='Allow for this session|1\.[ \t]+Allow once'
+
+# Opencode arrow-key prompt: "Allow once   Allow always   Reject" with cursor.
+# Default is "Allow once" highlighted — Enter accepts that. To accept "Allow
+# always" (avoid re-prompt on same path), need Right-Arrow + Enter. We pick
+# "Allow always" to minimize re-prompts during a multi-round review.
+OPENCODE_PROMPT_RE='Allow once[ \t]+Allow always[ \t]+Reject'
+
+# Destructive — NEVER auto-approve. Agent stays stuck so user sees it.
+DESTRUCTIVE_RE='\brm -rf\b|\brm -fr\b|\brm +-r +-f\b|\bsudo\b|\bDROP +TABLE\b|\bTRUNCATE\b|\bgit +push +.*--force\b|\bgit +push +-f\b|\bgit +reset +--hard\b|\bgit +checkout +\.\b|\bgit +clean +-[fdx]\b|\bDELETE +FROM\b|\bdd +if=\b|>\s*/dev/(sd|nvme|hd|xvd)|\bmkfs\b|\biptables +-F\b|\bkill +-9 +1\b|:\(\)\{:\|:&\};:|\|\s*(sh|bash|zsh)\s*$|curl[^|]*\|\s*(sh|bash)|wget[^|]*\|\s*(sh|bash)|\beval\s+\$\(|--no-verify|--no-gpg-sign|chmod +(-R +)?777|chown +-R\b|\bcrontab +-r\b|\bshutdown\b|\breboot\b|\bsystemctl +(stop|disable|mask)\b|\bdocker +(rm|kill) +-f\b|>\s*/etc/'
+
+declare -A APPROVED_AT
+declare -A DESTRUCTIVE_FLAGGED
+
+check_and_approve_prompts() {
+  local name="$1"
+  local sess="${SESS[$name]:-}"
+  [ -z "$sess" ] && return 0
+  local pane
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
+  echo "$pane" | grep -qiE "$PROMPT_RE" || return 0
+
+  if echo "$pane" | grep -qiE "$DESTRUCTIVE_RE"; then
+    # Only print once per agent (don't spam the log)
+    if [ "${DESTRUCTIVE_FLAGGED[$name]:-0}" != "1" ]; then
+      DESTRUCTIVE_FLAGGED[$name]=1
+      printf '  🛑 %-12s DESTRUCTIVE prompt detected — REFUSING auto-approve. Attach session to inspect.\n' "$name" >&2
+      printf '  🛑 %-12s tmux attach -t %s\n' "$name" "$sess" >&2
+      # Write a flag file the slash command can surface
+      echo "$name: $(date -Iseconds): destructive prompt blocked" >> "$out/destructive-blocks.log" 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  local now last
+  now=$(date +%s)
+  last="${APPROVED_AT[$name]:-0}"
+  [ $((now - last)) -lt 30 ] && return 0
+  APPROVED_AT[$name]=$now
+
+  # Three prompt formats — pick the right keystrokes:
+  if echo "$pane" | grep -qE "$OPENCODE_PROMPT_RE"; then
+    # Opencode arrow-key prompt: cursor on "Allow once", we want "Allow always".
+    # Send Right-Arrow + Enter.
+    printf '  ↩ %-12s opencode prompt — auto-approving (Right + Enter = Allow always)\n' "$name" >&2
+    tmux send-keys -t "$sess" Right Enter 2>/dev/null || true
+  elif echo "$pane" | grep -qiE "$NUMBERED_PROMPT_RE"; then
+    # Gemini numbered prompt — send "2" (Allow for this session).
+    printf '  ↩ %-12s gemini numbered prompt — auto-approving (2 = Allow for session)\n' "$name" >&2
+    tmux send-keys -t "$sess" "2" Enter 2>/dev/null || true
+  else
+    # Codex-style y/n.
+    printf '  ↩ %-12s safe prompt — auto-approving (y + Enter)\n' "$name" >&2
+    tmux send-keys -t "$sess" "y" Enter 2>/dev/null || true
+  fi
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────
+[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|state-get|state-set} ..." >&2; exit 2; }
+
+sub="$1"; shift
+case "$sub" in
+  pick-agents) cmd_pick_agents "$@" ;;
+  review)      cmd_review "$@" ;;
+  state-get)   cmd_state_get ;;
+  state-set)   cmd_state_set "$@" ;;
+  clean)       cmd_clean "$@" ;;
+  -h|--help)
+    awk '/^[^#]/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+    exit 0 ;;
+  *) echo "work: unknown subcommand '$sub'" >&2; exit 2 ;;
+esac

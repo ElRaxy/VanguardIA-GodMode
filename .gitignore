@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python (in case anyone runs pack-build outside its target env)
+__pycache__/
+*.pyc
+
+# Local config / secrets — never commit
+.env
+.env.local
+*.api-keys.backup
+auth.json
+
+# Run artifacts (the orchestrator writes these to /tmp anyway, but just in case)
+/tmp/work-*
+.work/

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+work-converge — parse reviewer XML responses, compute lineage-weighted quorum.
+
+Reads each <agent>-findings.md from <out-dir>, extracts the <findings> block
+(reviewers may wrap it in chatter — we tolerate that), classifies each verdict,
+and decides whether quorum is reached.
+
+Quorum rule (lineage-weighted):
+  agree if ≥1 codex agent AND ≥1 gemini agent AND ≥1 opencode agent
+  all returned <verdict agree="true">.
+  Partial verdicts count as agree only if reasoning explicitly says minor-only.
+
+Exit codes:
+  0  → quorum reached, proceed
+  1  → quorum NOT reached (revise + retry recommended)
+  2  → too many missing/dead reviewers to decide (escalate to user)
+
+Output: JSON to stdout with full breakdown.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+
+def load_agent_types(agents_json: Path) -> dict[str, str]:
+    """name → type from agents.json."""
+    data = json.loads(agents_json.read_text())
+    return {a["name"]: a["type"] for a in data["agents"]}
+
+
+# Reviewers may wrap their XML in markdown chatter; pull just the <findings> block.
+FINDINGS_RE = re.compile(r"<findings>.*?</findings>", re.DOTALL | re.IGNORECASE)
+VERDICT_RE = re.compile(
+    r'<verdict\s+agree="(true|false|partial)"\s*>(.*?)</verdict>',
+    re.DOTALL | re.IGNORECASE,
+)
+FINDING_RE = re.compile(
+    r'<finding\s+severity="(critical|high|medium|low)"\s+category="([^"]+)"\s*>(.*?)</finding>',
+    re.DOTALL | re.IGNORECASE,
+)
+DONE_RE = re.compile(r"^##\s*DONE\s*$", re.MULTILINE)
+
+
+def extract_response(text: str) -> dict:
+    """Pull verdict + findings out of one reviewer's file. Tolerant of wrapper text."""
+    block_match = FINDINGS_RE.search(text)
+    block = block_match.group(0) if block_match else text  # fall back to whole text
+
+    # Try strict XML first; fall back to regex if reviewer's XML is malformed.
+    findings = []
+    verdict = None
+    verdict_reason = ""
+
+    try:
+        root = ET.fromstring(block)
+        for f in root.findall("finding"):
+            findings.append({
+                "severity": (f.get("severity") or "medium").lower(),
+                "category": (f.get("category") or "other").lower(),
+                "claim": (f.findtext("claim") or "").strip(),
+                "evidence": (f.findtext("evidence") or "").strip(),
+                "suggestion": (f.findtext("suggestion") or "").strip(),
+            })
+        v = root.find("verdict")
+        if v is not None:
+            verdict = (v.get("agree") or "").lower() or None
+            verdict_reason = (v.findtext("reasoning") or "").strip()
+    except ET.ParseError:
+        # Regex fallback
+        for m in FINDING_RE.finditer(block):
+            sev, cat, body = m.groups()
+            claim_m = re.search(r"<claim>(.*?)</claim>", body, re.DOTALL)
+            evid_m = re.search(r"<evidence>(.*?)</evidence>", body, re.DOTALL)
+            sugg_m = re.search(r"<suggestion>(.*?)</suggestion>", body, re.DOTALL)
+            findings.append({
+                "severity": sev.lower(),
+                "category": cat.lower(),
+                "claim": (claim_m.group(1) if claim_m else "").strip(),
+                "evidence": (evid_m.group(1) if evid_m else "").strip(),
+                "suggestion": (sugg_m.group(1) if sugg_m else "").strip(),
+            })
+        v_match = VERDICT_RE.search(block)
+        if v_match:
+            verdict = v_match.group(1).lower()
+            verdict_reason = v_match.group(2).strip()
+            verdict_reason = re.sub(r"<reasoning>(.*?)</reasoning>", r"\1", verdict_reason, flags=re.DOTALL).strip()
+
+    return {
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+        "findings": findings,
+        "done_marker": bool(DONE_RE.search(text)),
+    }
+
+
+def quorum_check(per_agent: dict, agent_types: dict[str, str]) -> dict:
+    """
+    Lineage-weighted quorum:
+      need ≥1 agent of each {codex, gemini, opencode} to return verdict=true.
+      verdict=partial counts as agree IFF the reviewer's findings list has no
+      severity in {critical, high} (i.e. only nits).
+    """
+    by_lineage = {"codex": [], "gemini": [], "opencode": []}
+    for agent_name, resp in per_agent.items():
+        lin = agent_types.get(agent_name)
+        if lin not in by_lineage:
+            continue
+
+        v = resp["verdict"]
+        # Missing verdict (no file, malformed file, or no <verdict> block)
+        # → don't count as disagree; treat as MISSING for that lineage.
+        if v is None:
+            continue
+
+        if v == "true":
+            agree = True
+        elif v == "partial":
+            blockers = [f for f in resp["findings"] if f["severity"] in ("critical", "high")]
+            agree = not blockers
+        else:
+            agree = False
+
+        by_lineage[lin].append({"agent": agent_name, "agree": agree, "verdict": v})
+
+    lineage_status = {}
+    for lin, agents in by_lineage.items():
+        if not agents:
+            lineage_status[lin] = "missing"
+        elif any(a["agree"] for a in agents):
+            lineage_status[lin] = "agree"
+        else:
+            lineage_status[lin] = "disagree"
+
+    # Decision
+    missing = [l for l, s in lineage_status.items() if s == "missing"]
+    disagree = [l for l, s in lineage_status.items() if s == "disagree"]
+
+    if missing and not disagree:
+        decision = "incomplete"  # exit 2
+    elif not missing and not disagree:
+        decision = "agree"  # exit 0
+    else:
+        decision = "disagree"  # exit 1
+
+    return {
+        "decision": decision,
+        "by_lineage": by_lineage,
+        "lineage_status": lineage_status,
+        "missing_lineages": missing,
+        "disagreeing_lineages": disagree,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--out-dir", required=True, help="dir containing <agent>-findings.md files")
+    ap.add_argument("--agents", required=True, help="comma-separated list of agents that were nudged")
+    ap.add_argument("--agents-json", default="$HOME/.config/agent-sessions/agents.json")
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    agent_types = load_agent_types(Path(args.agents_json))
+    expected = [a.strip() for a in args.agents.split(",") if a.strip()]
+
+    per_agent = {}
+    for name in expected:
+        f = out_dir / f"{name}-findings.md"
+        if not f.exists():
+            per_agent[name] = {"verdict": None, "findings": [], "done_marker": False, "verdict_reason": "(no file)"}
+            continue
+        text = f.read_text(errors="replace")
+        per_agent[name] = extract_response(text)
+
+    quorum = quorum_check(per_agent, agent_types)
+
+    # Aggregate finding stats
+    all_findings = []
+    for name, resp in per_agent.items():
+        for f in resp["findings"]:
+            all_findings.append({**f, "agent": name})
+
+    sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for f in all_findings:
+        sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+
+    output = {
+        "decision": quorum["decision"],
+        "lineage_status": quorum["lineage_status"],
+        "missing_lineages": quorum["missing_lineages"],
+        "disagreeing_lineages": quorum["disagreeing_lineages"],
+        "per_agent": per_agent,
+        "by_lineage": quorum["by_lineage"],
+        "severity_counts": sev_counts,
+        "total_findings": len(all_findings),
+        "blockers": [f for f in all_findings if f["severity"] in ("critical", "high")],
+    }
+
+    print(json.dumps(output, indent=2))
+
+    sys.exit({"agree": 0, "disagree": 1, "incomplete": 2}[quorum["decision"]])
+
+
+if __name__ == "__main__":
+    main()

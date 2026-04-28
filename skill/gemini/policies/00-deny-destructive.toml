@@ -1,0 +1,312 @@
+# ============================================================================
+# DENY rules — destructive commands. Top priority. Win over any allow rule.
+# Gemini is bad at deletion / reset operations; these never run, never prompt.
+#
+# REGEX NOTES (2026-04-28 ReDoS-safe rewrite):
+#   • Gemini's ReDoS detector flags ANY (?:...[ \t]+)? — "?" + "+" = nested.
+#   • Workaround: split into 2 rules per command. One bare, one with `sudo `.
+#     This avoids optional groups containing quantifiers entirely.
+#   • Each pattern has ≤1 quantifier on a non-greedy single char class.
+# ============================================================================
+
+# ============================================================================
+# File / disk destruction
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:rm|rmdir|unlink|shred|truncate)\b'
+decision = "deny"
+priority = 950
+denyMessage = "Destructive file removal blocked for Gemini (rm/rmdir/unlink/shred/truncate)."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sudo[ \t]+(?:rm|rmdir|unlink|shred|truncate)\b'
+decision = "deny"
+priority = 950
+denyMessage = "Destructive file removal blocked for Gemini (sudo rm/...)."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bdd[ \t]+(?:if|of)='
+decision = "deny"
+priority = 950
+denyMessage = "dd is blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:chmod|chown|chgrp)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Permission changes (chmod/chown/chgrp) blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sudo[ \t]+(?:chmod|chown|chgrp)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Permission changes (sudo chmod/...) blocked for Gemini."
+
+# ============================================================================
+# Privilege escalation / process control
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:sudo|su|doas|pkexec)\b'
+decision = "deny"
+priority = 950
+denyMessage = "Privilege escalation blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:kill|pkill|killall)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Process kill commands blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\b(?:reboot|shutdown|halt|poweroff)\b'
+decision = "deny"
+priority = 999
+denyMessage = "System power commands blocked for Gemini."
+
+# ============================================================================
+# Package mutations
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:apt|apt-get|dpkg|yum|dnf|pacman|brew|snap)[ \t]+(?:install|remove|purge|autoremove|upgrade|update)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Package mutations blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:npm|pnpm|yarn|pip|pip3|cargo|gem|go)[ \t]+(?:install|uninstall|add|remove|rm|update|upgrade|publish)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Package-manager mutations blocked for Gemini."
+
+# ============================================================================
+# Git destructive
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+push[ \t]+-f\b'
+decision = "deny"
+priority = 940
+denyMessage = "git push -f blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+push[ \t]+--force'
+decision = "deny"
+priority = 940
+denyMessage = "git push --force blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+reset[ \t]+--hard\b'
+decision = "deny"
+priority = 940
+denyMessage = "git reset --hard blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+clean[ \t]+-[fdx]'
+decision = "deny"
+priority = 940
+denyMessage = "git clean -f/-d/-x blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+branch[ \t]+-D\b'
+decision = "deny"
+priority = 940
+denyMessage = "git branch -D (force-delete) blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+(?:restore|checkout)[ \t]+\.'
+decision = "deny"
+priority = 940
+denyMessage = "git restore . / git checkout . (discards work) blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+checkout[ \t]+--'
+decision = "deny"
+priority = 940
+denyMessage = "git checkout -- (discards work) blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^git[ \t]+(?:filter-branch|filter-repo)\b'
+decision = "deny"
+priority = 940
+denyMessage = "git history rewriting blocked for Gemini."
+
+# ============================================================================
+# gh destructive
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^gh[ \t]+pr[ \t]+(?:close|merge|edit)\b'
+decision = "deny"
+priority = 940
+denyMessage = "gh pr close/merge/edit blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^gh[ \t]+issue[ \t]+(?:close|edit|delete)\b'
+decision = "deny"
+priority = 940
+denyMessage = "gh issue close/edit/delete blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^gh[ \t]+repo[ \t]+(?:delete|edit|archive)\b'
+decision = "deny"
+priority = 940
+denyMessage = "gh repo destructive ops blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^gh[ \t]+release[ \t]+delete\b'
+decision = "deny"
+priority = 940
+denyMessage = "gh release delete blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^gh[ \t]+api\b.*-X[ \t]?(?:DELETE|PUT|PATCH)\b'
+decision = "deny"
+priority = 940
+denyMessage = "gh api write methods (DELETE/PUT/PATCH) blocked for Gemini."
+
+# ============================================================================
+# DB / SQL destructive (psql, supabase)
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bpsql\b.*\b(?:DROP|TRUNCATE)\b'
+decision = "deny"
+priority = 940
+denyMessage = "DROP / TRUNCATE via psql blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bsupabase\b.*\b(?:DROP|TRUNCATE)\b'
+decision = "deny"
+priority = 940
+denyMessage = "DROP / TRUNCATE via supabase CLI blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bpsql\b.*\bDELETE[ \t]+FROM\b'
+decision = "deny"
+priority = 940
+denyMessage = "DELETE FROM via psql blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bsupabase\b.*\bDELETE[ \t]+FROM\b'
+decision = "deny"
+priority = 940
+denyMessage = "DELETE FROM via supabase CLI blocked for Gemini."
+
+# ============================================================================
+# LXC / Docker mutations
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:lxc|docker)[ \t]+(?:delete|rm|rmi|stop|kill|prune)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Destructive lxc/docker ops blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sudo[ \t]+(?:lxc|docker)[ \t]+(?:delete|rm|rmi|stop|kill|prune)\b'
+decision = "deny"
+priority = 940
+denyMessage = "Destructive sudo lxc/docker ops blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bdocker[ \t]+system[ \t]+prune\b'
+decision = "deny"
+priority = 940
+denyMessage = "docker system prune blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '\bdocker[ \t]+exec[ \t]+\S+[ \t]+(?:rm|chown|chmod)\b'
+decision = "deny"
+priority = 940
+denyMessage = "docker exec ... (rm/chown/chmod) blocked for Gemini."
+
+# ============================================================================
+# systemd / service / cron mutations
+# ============================================================================
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^(?:systemctl|service)[ \t]+(?:stop|disable|mask|reload|restart)\b'
+decision = "deny"
+priority = 940
+denyMessage = "systemctl/service mutations blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sudo[ \t]+(?:systemctl|service)[ \t]+(?:stop|disable|mask|reload|restart)\b'
+decision = "deny"
+priority = 940
+denyMessage = "sudo systemctl/service mutations blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^crontab[ \t]+-r\b'
+decision = "deny"
+priority = 950
+denyMessage = "crontab -r (wipes user crontab) blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sudo[ \t]+crontab[ \t]+-r\b'
+decision = "deny"
+priority = 950
+denyMessage = "sudo crontab -r blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^update-rc\.d\b'
+decision = "deny"
+priority = 940
+denyMessage = "update-rc.d blocked for Gemini."
+
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = '^sudo[ \t]+update-rc\.d\b'
+decision = "deny"
+priority = 940
+denyMessage = "sudo update-rc.d blocked for Gemini."
+
+# ============================================================================
+# Writes outside the workspace (system paths)
+# ============================================================================
+
+[[rule]]
+toolName = ["write_file", "replace"]
+argsPattern = '"file_path":"/(?:etc|usr|var|boot|sys|proc|root|opt|bin|sbin|lib)/'
+decision = "deny"
+priority = 950
+denyMessage = "Writes to system paths (/etc, /usr, /var, /boot, /sys, /proc, /root, /opt, /bin, /sbin, /lib) blocked for Gemini."
