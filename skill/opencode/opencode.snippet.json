@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "_comment": "GodModeSkill opencode permissions — file ops auto-approved, bash/task asks (work runtime guard catches and approves safe ones, refuses destructive). external_directory MUST be allow so reviewers can read /tmp/work-* packs and write findings.",
+  "_comment": "GodModeSkill opencode permissions \u2014 file ops auto-approved, bash uses pattern allow-list (read-only commands auto, others ask). external_directory MUST be allow so reviewers can read /tmp/work-* packs and write findings. Verify pattern syntax against your opencode version on first launch.",
   "permission": {
     "read": "allow",
     "edit": "allow",
@@ -15,7 +15,38 @@
     "codesearch": "allow",
     "skill": "allow",
     "question": "allow",
-    "bash": "ask",
+    "bash": {
+      "ls*": "allow",
+      "cat*": "allow",
+      "head*": "allow",
+      "tail*": "allow",
+      "grep*": "allow",
+      "rg*": "allow",
+      "find*": "allow",
+      "fd*": "allow",
+      "wc*": "allow",
+      "echo*": "allow",
+      "pwd": "allow",
+      "which*": "allow",
+      "type*": "allow",
+      "file*": "allow",
+      "stat*": "allow",
+      "git status*": "allow",
+      "git log*": "allow",
+      "git diff*": "allow",
+      "git show*": "allow",
+      "git branch*": "allow",
+      "git remote*": "allow",
+      "git rev-parse*": "allow",
+      "git ls-files*": "allow",
+      "git blame*": "allow",
+      "jq*": "allow",
+      "awk*": "allow",
+      "sed -n*": "allow",
+      "for *": "allow",
+      "while *": "allow",
+      "*": "ask"
+    },
     "task": "ask"
   }
 }

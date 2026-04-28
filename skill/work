@@ -83,8 +83,13 @@ for lineage in ("codex", "gemini", "opencode"):
         print(json.dumps({"error": f"no alive {lineage} agent available",
                           "exclude": list(exclude)}), file=sys.stderr)
         sys.exit(1)
-    # Sort by last_used_at (oldest first); never-used = epoch 0
-    pool.sort(key=lambda a: lru.get(a["name"], "1970-01-01T00:00:00Z"))
+    # Sort by (priority asc, last_used_at asc).
+    # Lower priority number = preferred. Default 100 if unset.
+    # Within same priority, LRU wins (oldest used first).
+    pool.sort(key=lambda a: (
+        a.get("priority", 100),
+        lru.get(a["name"], "1970-01-01T00:00:00Z"),
+    ))
     picked[lineage] = pool[0]["name"]
 
 print(json.dumps(picked, indent=2))

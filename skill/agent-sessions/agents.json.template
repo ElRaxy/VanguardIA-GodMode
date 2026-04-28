@@ -11,8 +11,14 @@
       "quota_group": "chatgpt-acct-1",
       "balance_endpoint": null,
       "rate_limits": {
-        "weekly": { "description": "weekly fixed reset",   "next_reset": null },
-        "short":  { "description": "5h sliding from first msg", "next_reset": null }
+        "weekly": {
+          "description": "weekly fixed reset",
+          "next_reset": null
+        },
+        "short": {
+          "description": "5h sliding from first msg",
+          "next_reset": null
+        }
       },
       "notes": "Codex on ChatGPT subscription account 1. Multi-account: copy ~/.codex to ~/.codex-cdx-N and set CODEX_HOME=$HOME/.codex-cdx-N when launching.",
       "codex_home": "$HOME/.codex",
@@ -31,8 +37,14 @@
       "quota_group": "google-ai",
       "balance_endpoint": null,
       "rate_limits": {
-        "weekly": { "description": "daily reset (midnight Pacific)", "next_reset": null },
-        "short":  { "description": "n/a — Gemini CLI uses daily quota", "next_reset": null }
+        "weekly": {
+          "description": "daily reset (midnight Pacific)",
+          "next_reset": null
+        },
+        "short": {
+          "description": "n/a \u2014 Gemini CLI uses daily quota",
+          "next_reset": null
+        }
       },
       "notes": "Gemini CLI on Google AI Pro. Run /stats inside TUI for live quota.",
       "nudge_command": "$HOME/dev/codex-bridge/nudge-gem",
@@ -50,14 +62,21 @@
       "quota_group": "opencode-go",
       "balance_endpoint": null,
       "rate_limits": {
-        "weekly": { "description": "OpenCode Go plan — query inside TUI", "next_reset": null },
-        "short":  { "description": "OpenCode Go plan — see /usage inside TUI", "next_reset": null }
+        "weekly": {
+          "description": "OpenCode Go plan \u2014 query inside TUI",
+          "next_reset": null
+        },
+        "short": {
+          "description": "OpenCode Go plan \u2014 see /usage inside TUI",
+          "next_reset": null
+        }
       },
       "notes": "Kimi K2.6 (3x limits) via OpenCode Go subscription. Alternative: replace with moonshot/kimi-k2.6 + MOONSHOT_API_KEY for direct API access.",
       "nudge_command": "$HOME/dev/codex-bridge/nudge-kimi",
       "tmux_env_var": "KIMI_TMUX_SESSION",
       "launch_command": "$HOME/.opencode/bin/opencode -m opencode-go/kimi-k2.6",
-      "working_dir": "$HOME/dev/kimi-session"
+      "working_dir": "$HOME/dev/kimi-session",
+      "priority": 1
     },
     {
       "name": "deepseek",
@@ -69,14 +88,21 @@
       "quota_group": "opencode-go",
       "balance_endpoint": null,
       "rate_limits": {
-        "weekly": { "description": "OpenCode Go plan — query inside TUI", "next_reset": null },
-        "short":  { "description": "OpenCode Go plan — see /usage inside TUI", "next_reset": null }
+        "weekly": {
+          "description": "OpenCode Go plan \u2014 query inside TUI",
+          "next_reset": null
+        },
+        "short": {
+          "description": "OpenCode Go plan \u2014 see /usage inside TUI",
+          "next_reset": null
+        }
       },
       "notes": "DeepSeek V4 Pro via OpenCode Go subscription. Alternative: replace with deepseek/deepseek-v4-pro + DEEPSEEK_API_KEY for direct API access.",
       "nudge_command": "$HOME/dev/codex-bridge/nudge-deepseek",
       "tmux_env_var": "DEEPSEEK_TMUX_SESSION",
       "launch_command": "$HOME/.opencode/bin/opencode -m opencode-go/deepseek-v4-pro",
-      "working_dir": "$HOME/dev/deepseek-session"
+      "working_dir": "$HOME/dev/deepseek-session",
+      "priority": 2
     }
   ]
 }
