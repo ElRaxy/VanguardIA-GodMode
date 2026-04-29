@@ -1,0 +1,69 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter",
+      "options": {
+        "apiKey": "{env:OPENROUTER_API_KEY}",
+        "baseURL": "https://openrouter.ai/api/v1"
+      },
+      "models": {
+        "qwen/qwen3-coder:free": {
+          "name": "Qwen3 Coder Free"
+        },
+        "z-ai/glm-4.5-air:free": {
+          "name": "GLM 4.5 Air Free"
+        }
+      }
+    }
+  },
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "lsp": "allow",
+    "todowrite": "allow",
+    "websearch": "allow",
+    "webfetch": "allow",
+    "external_directory": "allow",
+    "codesearch": "allow",
+    "skill": "allow",
+    "question": "allow",
+    "bash": {
+      "ls*": "allow",
+      "cat*": "allow",
+      "head*": "allow",
+      "tail*": "allow",
+      "grep*": "allow",
+      "rg*": "allow",
+      "find*": "allow",
+      "fd*": "allow",
+      "wc*": "allow",
+      "echo*": "allow",
+      "pwd": "allow",
+      "which*": "allow",
+      "type*": "allow",
+      "file*": "allow",
+      "stat*": "allow",
+      "git status*": "allow",
+      "git log*": "allow",
+      "git diff*": "allow",
+      "git show*": "allow",
+      "git branch*": "allow",
+      "git remote*": "allow",
+      "git rev-parse*": "allow",
+      "git ls-files*": "allow",
+      "git blame*": "allow",
+      "jq*": "allow",
+      "awk*": "allow",
+      "sed -n*": "allow",
+      "for *": "allow",
+      "while *": "allow",
+      "*": "ask"
+    },
+    "task": "ask"
+  }
+}

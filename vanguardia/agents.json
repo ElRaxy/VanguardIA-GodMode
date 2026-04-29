@@ -1,0 +1,84 @@
+{
+  "_comment": "VanguardIA GodMode fleet — 100% free tier. Codex via ChatGPT Plus, Gemini via Google AI Studio free, OpenCode reviewers via OpenRouter free models.",
+  "agents": [
+    {
+      "name": "cdx-1",
+      "tmux_session": "cdx-1",
+      "type": "codex",
+      "model": "gpt-5.5",
+      "auth": "subscription",
+      "auth_provider": "ChatGPT",
+      "quota_group": "chatgpt-acct-1",
+      "balance_endpoint": null,
+      "rate_limits": {
+        "weekly": { "description": "weekly fixed reset", "next_reset": null },
+        "short": { "description": "5h sliding from first msg", "next_reset": null }
+      },
+      "notes": "Codex on ChatGPT Plus (single account).",
+      "codex_home": "$HOME/.codex",
+      "nudge_command": "$HOME/dev/codex-bridge/nudge",
+      "tmux_env_var": "CDX_TMUX_SESSION",
+      "launch_command": "CODEX_HOME=$HOME/.codex codex",
+      "working_dir": "$HOME"
+    },
+    {
+      "name": "gem-1",
+      "tmux_session": "gem-1",
+      "type": "gemini",
+      "model": "gemini-2.5-pro",
+      "auth": "subscription",
+      "auth_provider": "Google AI Free",
+      "quota_group": "google-ai-free",
+      "balance_endpoint": null,
+      "rate_limits": {
+        "weekly": { "description": "daily 1500 req Pro tier free", "next_reset": null },
+        "short": { "description": "n/a — daily quota", "next_reset": null }
+      },
+      "notes": "Gemini CLI on Google AI Studio free tier (1500 req/día).",
+      "nudge_command": "$HOME/dev/codex-bridge/nudge-gem",
+      "tmux_env_var": "GEM_TMUX_SESSION",
+      "launch_command": "gemini --approval-mode auto_edit",
+      "working_dir": "$HOME"
+    },
+    {
+      "name": "kimi",
+      "tmux_session": "kimi",
+      "type": "opencode",
+      "model": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+      "auth": "api_key",
+      "auth_provider": "OpenRouter Free",
+      "quota_group": "openrouter-free",
+      "balance_endpoint": null,
+      "rate_limits": {
+        "weekly": { "description": "OpenRouter free: 200 req/día (1000 con $10 credits)", "next_reset": null },
+        "short": { "description": "20 req/min", "next_reset": null }
+      },
+      "notes": "Nemotron-3-Super-120B via OpenRouter free. Family: NVIDIA — distinta de Codex/Gemini/ZhipuAI. Qwen3-Coder rate-limited en abr-2026.",
+      "nudge_command": "$HOME/dev/codex-bridge/nudge-kimi",
+      "tmux_env_var": "KIMI_TMUX_SESSION",
+      "launch_command": "set -a; source $HOME/.config/opencode/.env; set +a; opencode -m openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+      "working_dir": "$HOME/dev/kimi-session",
+      "priority": 1
+    },
+    {
+      "name": "deepseek",
+      "tmux_session": "deepseek",
+      "type": "opencode",
+      "model": "openrouter/z-ai/glm-4.5-air:free",
+      "auth": "api_key",
+      "auth_provider": "OpenRouter Free",
+      "quota_group": "openrouter-free",
+      "balance_endpoint": null,
+      "rate_limits": {
+        "weekly": { "description": "OpenRouter free: 200 req/día (1000 con $10 credits)", "next_reset": null },
+        "short": { "description": "20 req/min", "next_reset": null }
+      },
+      "notes": "GLM-4.5-Air via OpenRouter free. Family: ZhipuAI — distinta de Qwen/Codex/Gemini.",
+      "nudge_command": "$HOME/dev/codex-bridge/nudge-deepseek",
+      "tmux_env_var": "DEEPSEEK_TMUX_SESSION",
+      "launch_command": "set -a; source $HOME/.config/opencode/.env; set +a; opencode -m openrouter/z-ai/glm-4.5-air:free",
+      "working_dir": "$HOME/dev/deepseek-session",
+      "priority": 2
+    }
+  ]
+}

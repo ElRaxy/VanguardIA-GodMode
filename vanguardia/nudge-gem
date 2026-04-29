@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SESSION="${GEM_TMUX_SESSION:-gem-1}"
+PROMPT="${1:-$(cat)}"
+tmux has-session -t "$SESSION" 2>/dev/null || { echo "no session $SESSION" >&2; exit 2; }
+tmux set-buffer -b nudge "$PROMPT"
+tmux paste-buffer -b nudge -t "$SESSION"
+sleep 0.5
+tmux send-keys -t "$SESSION" Enter
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
