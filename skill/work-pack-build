@@ -23,7 +23,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
-MEMORY_DIR = HOME / ".claude/projects/-home-ubuntu/memory"
+
+
+def _discover_memory_dir() -> Path:
+    """Find Claude Code memory dir (varies by project on disk).
+    Priority: $CLAUDE_MEMORY_DIR env, then most-recent project's memory/, then fallback."""
+    env_override = os.environ.get("CLAUDE_MEMORY_DIR")
+    if env_override and Path(env_override).is_dir():
+        return Path(env_override)
+    projects_dir = HOME / ".claude" / "projects"
+    if projects_dir.is_dir():
+        candidates = sorted(
+            (p for p in projects_dir.glob("*/memory") if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+    return HOME / ".claude" / "memory"  # fallback (may not exist)
+
+
+MEMORY_DIR = _discover_memory_dir()
 JOURNAL_DIR = HOME / ".claude/conversations"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 

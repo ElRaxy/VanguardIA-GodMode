@@ -38,13 +38,33 @@ AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
 STATE_DIR="$HOME/.work"
 STATE_FILE="$STATE_DIR/state.json"
 LRU_FILE="$STATE_DIR/agent-lru.json"
-sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
-sudo chown -R ubuntu:ubuntu "$STATE_DIR" 2>/dev/null || true
+mkdir -p "$STATE_DIR"
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$LRU_FILE"   ] || echo '{}' > "$LRU_FILE"
 
 [ -f "$AGENTS_JSON" ] || { echo "work: missing $AGENTS_JSON" >&2; exit 1; }
-# inotifywait is required only by `work review`; checked inside cmd_review.
+# Filesystem-event waiter is required only by `work review`; checked inside cmd_review.
+# Cross-platform: inotifywait (Linux) or fswatch (macOS).
+
+# wait_for_fs_event <dir> <timeout_sec>
+# Blocks until any file in <dir> is created/modified, or timeout elapses.
+# Zero CPU during wait (kernel-level FS notifications). Cross-platform.
+wait_for_fs_event() {
+  local dir="$1" timeout="${2:-5}"
+  if command -v inotifywait >/dev/null 2>&1; then
+    inotifywait -qq -e modify -e create "$dir" --timeout "$timeout" 2>/dev/null || true
+  elif command -v fswatch >/dev/null 2>&1; then
+    fswatch -1 "$dir" >/dev/null 2>&1 &
+    local fs_pid=$!
+    ( sleep "$timeout" && kill -TERM "$fs_pid" 2>/dev/null ) &
+    local kill_pid=$!
+    wait "$fs_pid" 2>/dev/null || true
+    kill -TERM "$kill_pid" 2>/dev/null || true
+    wait "$kill_pid" 2>/dev/null || true
+  else
+    sleep "$timeout"
+  fi
+}
 
 # ── pick-agents subcommand ───────────────────────────────────────────────
 cmd_pick_agents() {
@@ -169,8 +189,10 @@ PYEOF
 
 # ── review subcommand (the main event) ───────────────────────────────────
 cmd_review() {
-  command -v inotifywait >/dev/null || {
-    echo "work review: inotifywait required (sudo apt install inotify-tools)" >&2
+  command -v inotifywait >/dev/null 2>&1 || command -v fswatch >/dev/null 2>&1 || {
+    echo "work review: inotifywait (Linux) or fswatch (macOS) required" >&2
+    echo "  Linux: sudo apt install inotify-tools" >&2
+    echo "  macOS: brew install fswatch" >&2
     exit 1
   }
   local mode="" task="" task_id="" round=1 out=""
@@ -433,7 +455,7 @@ PYEOF
     # Block until ANY findings file changes (or timeout). 5s safety wake to
     # re-check permission prompts AND provider errors — catches stuck-on-prompt
     # or errored reviewers fast (was 15s, was 60s before that).
-    inotifywait -qq -e modify -e create "$out/" --timeout 5 2>/dev/null || true
+    wait_for_fs_event "$out/" 5
   done
 
   echo "  ✓ All ${done_count}/${#VALID[@]} reviewers done in ${elapsed}s" >&2
